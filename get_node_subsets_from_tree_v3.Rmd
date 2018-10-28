@@ -1,0 +1,300 @@
+---
+title: "randomforest_get_node_elements_v3"
+author: "Francis"
+date: "Oct 23, 2018"
+output: html_document
+---
+
+### Tree Sparsing Functions
+This is a Notebook in response to tasks:
+Given a single tree from RF as a dataframe (using randomForest::getTree), for each node I would like to
+1.       Get the subset of data at that node and its two children
+2.       Compute sth. of interest on this subset of data, e.g. Gini impurity or so
+
+
+There will be 3 main functions to perform the tree spasing functions: 
+1. getBag --> To retrieve bag elements based on the keep.inbag information of the getTree function. The bag will also be reindexed. 
+2. split_bag_from_node --> This function uses the split var and split point of one row of result from getTree to split the elements of the previous node, and write the spliting result to the corresponding left and right daughter.
+3. get_node_elements --> This function takes one bag and one tree, splits the nodes recursively, and return the getTree dataframe with node appended. 
+
+Load libraries and data, and set seed
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning=FALSE, fig.width = 8)
+
+#library(gbm)
+#update.packages('randomForest')
+
+library(randomForest)
+library(titanic)
+library(knitr)
+library(kableExtra)
+library(partykit)
+
+library(binaryLogic)
+library(prob)
+library(DT)
+
+fitNew = TRUE
+
+if (!fitNew) load("rf3a.rda") 
+
+set.seed(1)
+```
+
+## Get bag and reindex the bag
+```{r}
+getBag <- function(original_data, inbag){
+  ii = rep(1:nrow(original_data),inbag) # inbag has shape [number of rows, 1]
+  bag = subset(original_data[ii,])
+  rownames(bag) = 1:nrow(bag)
+  return(bag)
+}   
+```
+
+## Split in node elements and return lists of rownames.
+```{r}
+split_bag_from_node = function(in_node_df, tree_r){
+  # Get the split variable
+  split_var = as.character(tree_r[,'split var'])
+  
+  # Get a vector of in node elements
+  column_to_split = in_node_df[,split_var]
+
+  if (is.factor(in_node_df[,split_var])){
+      levels = unique(column_to_split)
+      levels = sort(levels, decreasing = T)
+      
+      split_point = levels[c(as.binary(tree_r[,'split point'],n=length(levels)))] %>% as.character #rF encodes male as 10, female as 01
+      mask =  column_to_split %in% split_point
+      left_daughter = rownames(in_node_df)[mask]
+      right_daughter = rownames(in_node_df)[!mask]
+  } else{
+      split_point = tree_r[,'split point']
+      mask = column_to_split <= split_point
+      left_daughter = rownames(in_node_df)[mask]
+      right_daughter = rownames(in_node_df)[!mask]
+  }
+  return(list(left_daughter = (left_daughter), right_daughter = (right_daughter)))
+}
+```
+
+## Main function
+```{r}
+get_node_elements <- function(tree, bag){
+  
+  # create new column for storing the index of data in the node
+  tree$node = NA
+  tree$node[1] = list(rownames(bag))
+  
+  # filter out non-terminal nodes (which their 'split var' = NA)
+  mask = is.na(tree[,'split var'])
+  non_terminal_node_in_tree = c(1:nrow(tree))[!mask]
+  
+  # Loop over non terminal nodes
+  for (i in non_terminal_node_in_tree){
+    
+    left_daughter = tree[i, 'left daughter']
+    right_daughter = tree[i, 'right daughter']
+    node_to_split_df = bag[unlist(tree$node[i]),]
+    left_and_right_daughter = split_bag_from_node(in_node_df = node_to_split_df, tree_r = tree[i,])
+    
+    tree$node[left_daughter] = list(left_and_right_daughter$left_daughter)
+    tree$node[right_daughter] = list(left_and_right_daughter$right_daughter)
+  } 
+  return(tree)
+  }
+```
+
+### Usage of the Functions
+```{r}
+## Standard create tree, get tree, and get bag procedure 
+titanic_train$Sex = as.factor(titanic_train$Sex) #Set Sex as factor
+rf3a = randomForest(formula = Survived ~ Sex + Pclass + PassengerId,
+                    data=titanic_train,
+                    ntree=10,
+                    importance=TRUE,
+                    mtry=2,
+                    keep.inbag=TRUE, 
+                    nodesize = 1) # nodesize control the terminal nodes
+
+# Start with first tree
+k=1
+tree = getTree(rf3a, labelVar = TRUE, k=k)
+bag = getBag(titanic_train,  rf3a$inbag[,k])
+newtree = get_node_elements(tree = tree,bag = bag)
+newtree$node[10]
+
+gini_process <-function(classes,splitvar = NULL){
+  #Assumes Splitvar is a logical vector
+  if (is.null(splitvar)){
+    base_prob <-table(classes)/length(classes)
+    return(1-sum(base_prob**2))
+  }
+  base_prob <-table(splitvar)/length(splitvar)
+  crosstab <- table(classes,splitvar)
+  crossprob <- prop.table(crosstab,2)
+  No_Node_Gini <- 1-sum(crossprob[,1]**2)
+  Yes_Node_Gini <- 1-sum(crossprob[,2]**2)
+  return(sum(base_prob * c(No_Node_Gini,Yes_Node_Gini)))
+}
+
+newtree$gini_index = NA#rep(-9999999, nrow(new_tree1))
+for (i in 1:nrow(newtree)){
+  newtree$gini_index[i] = gini_process(bag[newtree$node[[i]], 'Survived'])
+}
+```
+
+### Calculation of Entropy (discrete) and Information Gain 
+Reference: https://en.wikipedia.org/wiki/Decision_tree_learning 
+Continuous entropy is yet to be built, reference: https://en.wikipedia.org/wiki/Differential_entropy 
+```{r}
+entropy_process = function(node, bag, target_column_name){
+  mask = unlist(node)
+  column = bag[mask, target_column_name]
+  n_classes = length(unique(column))
+  p = table(column)/ length(column)
+  log_p = log(p, base = n_classes)
+  log_p[is.nan(log_p)] =0
+  entropy = -sum(p*log_p)
+  return(entropy)
+}
+
+newtree$entropy = sapply(newtree[,'node'], FUN=entropy_process, bag=bag, target_column_name='Survived')
+```
+Double check the entropy calculation
+```{r}
+# Since 'Survived' is binary, prediction = p 
+for (i in 1:nrow(tree)){
+  p = tree[i, 'prediction']
+  p_ = 1-p
+  log_p = log(p,base=2)
+  log_p_ = log(p_,base=2)
+  entropy = -sum(p*log_p, p_*log_p_)  %>% round(3)
+  if (is.na(entropy)){
+    entropy = 0
+  }
+  newtree_entropy = newtree[i,'entropy'] %>% round(3)
+  if(!(entropy == newtree_entropy)){
+    print(paste(i, 'is not match'))
+  }
+}
+```
+
+# Perform a loop on entropy to get the information gain of each row
+```{r}
+IG_result = c()
+for (i in 1:nrow(newtree)){
+  en_node = newtree[i, 'entropy'] # get the entropy of that row
+  n_node = newtree[i, 'node'] %>% unlist %>% length # get the number of elements of the bag
+  
+  ld = newtree[i, 'left daughter'] # row numeber of the left daughter
+  rd = newtree[i, 'right daughter'] # right daughter
+  
+  
+  if (ld==0|rd==0){ # information gain for terminal node = NA
+    IG=NA
+    IG_result = c(IG_result, IG)
+    next
+  }
+  
+  en_ld = newtree[ld, 'entropy'] # entropy of the left daughter
+  en_rd = newtree[rd, 'entropy'] # right daughter
+  
+  nld = newtree[ld, 'node']%>% unlist %>% length  # get the number of elements of left daughter
+  nrd = newtree[rd, 'node']%>% unlist %>% length # right
+  
+  IG = en_node - sum(en_ld*nld/n_node, en_rd*nrd/n_node) # formula of information gain
+  IG_result = c(IG_result, IG)
+}
+newtree$`information gain`=IG_result
+```
+
+```{r}
+terminal_node_mask = is.na(newtree$`split var`)
+plot(newtree[, 'gini_index'], type='l', xlab = 'nodes', ylab='gini index')
+plot(newtree[, 'entropy'], type='l', xlab = 'nodes', ylab='entropy')
+plot(newtree[!terminal_node_mask, 'information gain'], type='l', xlab = 'split (NON terminal nodes)', ylab='information gain')
+
+```
+
+### MISC
+vectorize information gain_process (in progress) 
+```{r}
+information_gain_process = function(newtree){
+  left_daughter = newtree[, 'left daughter']
+  right_daughter = newtree[, 'right daughter']
+  terminal_node_mask = c(left_daughter==0|right_daughter==0)
+  
+  entropy_node = newtree[,'entropy']
+  n_node = sapply(newtree[,'node'],length)
+  n_node[terminal_node_mask] = 0
+  
+  p_left_daughter = (sapply(newtree[left_daughter, 'node'], length) / n_node)
+  p_right_daughter = (sapply(newtree[right_daughter, 'node'], length) / n_node)
+  
+  entropy_left_daughter = newtree[left_daughter, 'entropy']
+  entropy_right_daughter = newtree[left_daughter, 'entropy']
+  
+  WS_daughter_entropy = p_left_daughter*entropy_left_daughter + p_right_daughter*entropy_right_daughter 
+  
+  information_gain = entropy_node - WS_daughter_entropy
+  
+  information_gain[terminal_node_mask] = NA
+  
+  return(information_gain)
+}
+```
+
+## Match the result from self-written function with original data (Only comparing the mean of Survival)
+```{r}
+check = function(newtree, bag){
+  match_row = c()
+  empty_row = c()
+  not_match_row = c()
+  
+  for (i in 1:nrow(newtree)){
+    tree_pred = newtree[i,'prediction']
+    
+    node = (newtree$node[i]) %>% unlist %>% unlist
+    bag_pred = mean(bag[node,'Survived'])
+
+    if (identical(node, character(0)) ){
+      empty_row = c(empty_row, i)
+      next
+    }
+    
+    if (round(tree_pred,3) == round(bag_pred,3)){
+      match_row = c(match_row, i)
+      } else{
+      not_match_row = c(not_match_row, i)
+    } 
+   }
+  return(list(match_row=match_row, empty_row=empty_row, not_match_row=not_match_row))
+  }
+```
+
+## Try out other trees
+```{r}
+result = vector(mode="list")
+
+for (k in 1:rf3a$ntree) {
+  tree = getTree(rf3a, labelVar = TRUE, k=k)
+  bag = getBag(titanic_train, rf3a$inbag[,k])
+  newtree = get_node_elements(tree = tree, bag = bag)
+  result[[paste('tree',k)]] <- check(newtree, bag)
+}
+str(result)
+```
+
+
+### Calculation of Entropy (discrete) and Information Gain (Working)
+
+```{r}
+mask = newtree[,'node'][1] %>% unlist
+column = bag[mask, 'Survived']
+n_classes = length(unique(column))
+p = table(column)/length(column)
+log_p = log(p, base = n_classes)
+log_p[is.nan(log_p)] =0
+-sum(p*log_p)
+```
