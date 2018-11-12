@@ -1,0 +1,222 @@
+---
+title: "Inspect Other Possible Splits"
+output: html_notebook
+---
+
+This is a Notebook in response to tasks:
+1. Split nodes
+2. Calculate entropy index of nodes
+
+Old stuffs: Load libraries and data, split again, and set seed
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning=FALSE, fig.width = 8)
+
+#library(gbm)
+#update.packages('randomForest')
+
+library(randomForest)
+library(titanic)
+library(knitr)
+library(kableExtra)
+library(partykit)
+
+library(binaryLogic)
+library(prob)
+library(DT)
+
+#fitNew = TRUE
+# if (!fitNew) load("rf3a.rda")
+set.seed(1)
+source('get_node_subsets_from_tree_functions.R')
+
+## Standard create tree, get tree, and get bag procedure 
+set.seed(123)
+ranRows=sample(nrow(titanic_train), 50)
+
+titanic_train$Pclass = as.factor(titanic_train$Pclass) # Set Pclass as factor
+titanic_train$Sex = as.factor(titanic_train$Sex) # Set Sex as factor
+titanic_train$PassengerId = as.numeric(titanic_train$PassengerId) # Make sure PassengerId is numeric
+#titanic_train$PassengerId = as.factor(titanic_train$PassengerId) # Error in randomForest.default(m, y, ...) : Can not handle categorical predictors with more than 53 categories.
+
+
+rf3a = randomForest(formula = Survived ~ Sex + Pclass + PassengerId,
+                    data=titanic_train[ranRows,],
+                    ntree=50,
+                    importance=FALSE,
+                    mtry=3,
+                    keep.inbag=TRUE, 
+                    nodesize = 1) # nodesize control the terminal nodes
+# Start with first tree
+k=25
+tree = getTree(rf3a, labelVar = TRUE, k=k)
+bag = getBag(titanic_train[ranRows,],  rf3a$inbag[,k])
+newtree = get_node_elements(tree = tree,bag = bag, verbose=0)
+#newtree$node[10]
+
+entropy_process = function(node, bag, target_column_name){
+  mask = unlist(node)
+  column = bag[mask, target_column_name]
+  n_classes = length(unique(column))
+  p = table(column)/ length(column)
+  log_p = log(p, base = n_classes)
+  log_p[is.nan(log_p)] =0
+  entropy = -sum(p*log_p)
+  return(entropy)
+}
+
+newtree$entropy = sapply(newtree[,'node'], FUN=entropy_process, bag=bag, target_column_name='Survived')
+
+IG_result = c()
+for (i in 1:nrow(newtree)){
+  en_node = newtree[i, 'entropy'] # get the entropy of that row
+  n_node = newtree[i, 'node'] %>% unlist %>% length # get the number of elements of the bag
+  
+  ld = newtree[i, 'left daughter'] # row numeber of the left daughter
+  rd = newtree[i, 'right daughter'] # right daughter
+  
+  
+  if (ld==0|rd==0){ # information gain for terminal node = NA
+    IG=NA
+    IG_result = c(IG_result, IG)
+    next
+  }
+  
+  en_ld = newtree[ld, 'entropy'] # entropy of the left daughter
+  en_rd = newtree[rd, 'entropy'] # right daughter
+  
+  nld = newtree[ld, 'node']%>% unlist %>% length  # get the number of elements of left daughter
+  nrd = newtree[rd, 'node']%>% unlist %>% length # right
+  
+  IG = en_node - sum(en_ld*nld/n_node, en_rd*nrd/n_node) # formula of information gain
+  IG_result = c(IG_result, IG)
+}
+newtree$`information gain`=IG_result
+```
+
+# Resplit function
+```{r}
+resplit <- function(bag = bag, split_var_list = c('Pclass', 'Sex'), verbose = 1, combination_thershold = 100){
+  # Initialize
+  set.seed(1)
+  best_split = c()
+  highest_IG = 0
+  
+  # Loop over split vars 
+  for (split_var in split_var_list){
+    unique = sort(unique(bag[[split_var]]), F)
+    length = length(unique)
+    combination = 2^length # Generating combinations; Binary combinations
+    
+    # Keep number of combination lower than a thershold 
+    if (combination < combination_thershold){
+      combination_list = c(1:combination)
+    } else {
+      # If there are too many combinations, we take samples of them. 
+      combination_list =  sample.int(combination,combination_thershold, replace=F) 
+    }
+    
+    # Loop over different combinations
+    for (i in combination_list){  
+      # Column to split
+      column_to_split = bag[[split_var]]
+      
+      # Obtain binary split point 
+      bin = as.binary(i-1,n=length)
+      split_point = unique[bin]
+    
+      # Split 
+      mask =  column_to_split %in% split_point
+      left_daughter = rownames(bag)[mask]
+      right_daughter = rownames(bag)[!mask]
+    
+      # Calculate entropy 
+      en_ld = entropy_process(bag=bag, node = list(c(left_daughter)), 'Survived')
+      en_rd = entropy_process(bag=bag, node = list(c(right_daughter)), 'Survived')
+      en_node = entropy_process(bag=bag, node = c(1:nrow(bag)),'Survived')
+    
+      # Information Gain 
+      IG = en_node - sum(en_ld*length(left_daughter)/nrow(bag), en_rd*length(right_daughter)/nrow(bag))
+    
+      # Update best split
+      if (IG > highest_IG){
+        highest_IG = IG
+        best_split = c(split_var, i)
+      }
+    # Debug
+    if (verbose>0){
+    cat('Trial',i, fill=T)
+    (cat('Current trial:',split_var, "\n",fill=F))
+  
+    cat(c('left daughter contains' ,split_point), fill=T)
+    cat(c('right daughter contains' ,unique[!bin]), fill=T)
+  
+    cat(c('left daugther rate of survived:',round(mean(bag[left_daughter, 'Survived']), 3)), fill=T)
+    cat(c('right daugther rate of survived:',round(mean(bag[right_daughter, 'Survived']), 3)), fill=T)
+    cat('Information Gain:', IG,'\n', fill=T)
+      }
+    }
+  }
+  if (verbose>0){
+    cat('best split:', best_split, 'Information Gain:', highest_IG)
+  }
+  return(c(best_split, highest_IG))
+}
+```
+
+# Usage of the resplit function
+```{r}
+mask = newtree$'split var'=='PassengerId'
+mask[is.na(mask)] <- F
+
+newtree$'new information gain' = NA
+newtree$'other best split var' = NA
+newtree$'other best split point' = NA
+
+PassengerId_row = rownames(newtree[mask, 1:10])
+for (i in c(1:length(PassengerId_row))){
+  row_number = as.numeric(PassengerId_row[i])
+  in_node_bag = bag[unlist(newtree[row_number, 'node']),1:10]
+  result = resplit(bag = in_node_bag, split_var = c('Pclass', 'Sex'), verbose=0)
+  newtree$'other best split var'[row_number] =  result[1]
+  newtree$'other best split point'[row_number] =  result[2]
+  newtree$'new information gain'[row_number] =  result[3]
+}
+newtree[PassengerId_row, c(3,4,10,11,12,13)]
+```
+From the above table, we can see that the randomForest library not always make the 'best' split. In the third line of the table, the information gain made by randomForest splitting on PassengerId is lower than splitting on Pclass. I have also checked other trees, and similar situation happen again. I still don't know why such thing happen. 
+
+# Empirical 
+Information gain increase when combination threshold increase (that means the algorithm sample more different combinations and take the best split out of them). 
+```{r}
+cat(
+  cat('split var,', 'split point,', 'Information Gain', fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 25), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 50), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 100), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 200), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 400), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 800), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 1600), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 3200), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 6400), fill=T),
+  cat(resplit(bag = bag, split_var = 'PassengerId', verbose=0, combination_thershold = 6400*2), fill=T),
+  cat(resplit(bag = bag, split_var = c('Pclass', 'Sex'), verbose=0), fill=T),
+  cat(resplit(bag = bag, split_var = 'Sex', verbose=0), fill=T),
+  cat(resplit(bag = bag, split_var = c('Pclass'), verbose=0), fill=T)
+)
+```
+
+# Other Stuffs
+```{r}
+i = 3
+row_number = as.numeric(PassengerId_row[i])
+in_node_bag = bag[unlist(newtree[row_number, 'node']),1:10]
+result = (resplit(bag = in_node_bag, split_var = c('Pclass', 'Sex'), verbose=0))
+result
+```
+
+```{r}
+newtree[PassengerId_row, c(1:13)]
+a = bag[unlist(newtree[PassengerId_row[3], 'node']), 1:5]
+resplit(bag = a, split_var_list = c('PassengerId', 'Sex', 'Pclass'), verbose=0)
+```

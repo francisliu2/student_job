@@ -5,12 +5,17 @@ date: "Oct 23, 2018"
 output: html_document
 ---
 
-### Tree Parsing Functions
-
+### Tree Sparsing Functions
 This is a Notebook in response to tasks:
 Given a single tree from RF as a dataframe (using randomForest::getTree), for each node I would like to
 1.       Get the subset of data at that node and its two children
 2.       Compute sth. of interest on this subset of data, e.g. Gini impurity or so
+
+
+There will be 3 main functions to perform the tree spasing functions: 
+1. getBag --> To retrieve bag elements based on the keep.inbag information of the getTree function. The bag will also be reindexed. 
+2. split_bag_from_node --> This function uses the split var and split point of one row of result from getTree to split the elements of the previous node, and write the spliting result to the corresponding left and right daughter.
+3. get_node_elements --> This function takes one bag and one tree, splits the nodes recursively, and return the getTree dataframe with node appended. 
 
 Load libraries and data, and set seed
 ```{r setup, include=FALSE}
@@ -29,34 +34,114 @@ library(binaryLogic)
 library(prob)
 library(DT)
 
-#fitNew = TRUE
-# if (!fitNew) load("rf3a.rda")
+fitNew = TRUE
+
+if (!fitNew) load("rf3a.rda") 
+
 set.seed(1)
+```
+
+## Get bag and reindex the bag
+```{r}
+getBag <- function(original_data, inbag){
+  ii = rep(1:nrow(original_data),inbag) # inbag has shape [number of rows, 1]
+  bag = subset(original_data[ii,])
+  rownames(bag) = 1:nrow(bag)
+  return(bag)
+}   
+```
+
+## Split in node elements and return lists of rownames.
+```{r}
+split_bag_from_node = function(in_node_df, tree_r){
+  # Get the split variable
+  split_var = as.character(tree_r[,'split var'])
+  
+  # Get a vector of in node elements
+  column_to_split = in_node_df[,split_var]
+
+  if (is.factor(in_node_df[,split_var])){
+      levels = unique(column_to_split)
+      levels = sort(levels, decreasing = T)
+      
+      split_point = levels[c(as.binary(tree_r[,'split point'],n=length(levels)))] %>% as.character #rF encodes male as 10, female as 01
+      mask =  column_to_split %in% split_point
+      left_daughter = rownames(in_node_df)[mask]
+      right_daughter = rownames(in_node_df)[!mask]
+  } else{
+      split_point = tree_r[,'split point']
+      mask = column_to_split <= split_point
+      left_daughter = rownames(in_node_df)[mask]
+      right_daughter = rownames(in_node_df)[!mask]
+  }
+  return(list(left_daughter = (left_daughter), right_daughter = (right_daughter)))
+}
+```
+
+## Main function
+```{r}
+get_node_elements <- function(tree, bag){
+  
+  # create new column for storing the index of data in the node
+  tree$node = NA
+  tree$node[1] = list(rownames(bag))
+  
+  # filter out non-terminal nodes (which their 'split var' = NA)
+  mask = is.na(tree[,'split var'])
+  non_terminal_node_in_tree = c(1:nrow(tree))[!mask]
+  
+  # Loop over non terminal nodes
+  for (i in non_terminal_node_in_tree){
+    
+    left_daughter = tree[i, 'left daughter']
+    right_daughter = tree[i, 'right daughter']
+    node_to_split_df = bag[unlist(tree$node[i]),]
+    left_and_right_daughter = split_bag_from_node(in_node_df = node_to_split_df, tree_r = tree[i,])
+    
+    tree$node[left_daughter] = list(left_and_right_daughter$left_daughter)
+    tree$node[right_daughter] = list(left_and_right_daughter$right_daughter)
+  } 
+  return(tree)
+  }
 ```
 
 ### Usage of the Functions
 ```{r}
-source('get_node_subsets_from_tree_functions.R')
-
 ## Standard create tree, get tree, and get bag procedure 
-set.seed(123)
-ranRows=sample(nrow(titanic_train), 50)
-
 titanic_train$Sex = as.factor(titanic_train$Sex) #Set Sex as factor
-
 rf3a = randomForest(formula = Survived ~ Sex + Pclass + PassengerId,
-                    data=titanic_train[ranRows,],
-                    ntree=50,
-                    importance=FALSE,
+                    data=titanic_train,
+                    ntree=10,
+                    importance=TRUE,
                     mtry=2,
                     keep.inbag=TRUE, 
                     nodesize = 1) # nodesize control the terminal nodes
+
 # Start with first tree
-k=10
+k=1
 tree = getTree(rf3a, labelVar = TRUE, k=k)
-bag = getBag(titanic_train[ranRows,],  rf3a$inbag[,k])
-newtree = get_node_elements(tree = tree,bag = bag, verbose=1)
-#newtree$node[10]
+bag = getBag(titanic_train,  rf3a$inbag[,k])
+newtree = get_node_elements(tree = tree,bag = bag)
+newtree$node[10]
+
+gini_process <-function(classes,splitvar = NULL){
+  #Assumes Splitvar is a logical vector
+  if (is.null(splitvar)){
+    base_prob <-table(classes)/length(classes)
+    return(1-sum(base_prob**2))
+  }
+  base_prob <-table(splitvar)/length(splitvar)
+  crosstab <- table(classes,splitvar)
+  crossprob <- prop.table(crosstab,2)
+  No_Node_Gini <- 1-sum(crossprob[,1]**2)
+  Yes_Node_Gini <- 1-sum(crossprob[,2]**2)
+  return(sum(base_prob * c(No_Node_Gini,Yes_Node_Gini)))
+}
+
+newtree$gini_index = NA#rep(-9999999, nrow(new_tree1))
+for (i in 1:nrow(newtree)){
+  newtree$gini_index[i] = gini_process(bag[newtree$node[[i]], 'Survived'])
+}
 ```
 
 ### Calculation of Entropy (discrete) and Information Gain 
@@ -93,10 +178,6 @@ for (i in 1:nrow(tree)){
     print(paste(i, 'is not match'))
   }
 }
-```
-
-```{r}
-newtree
 ```
 
 # Perform a loop on entropy to get the information gain of each row
